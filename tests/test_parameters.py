@@ -456,6 +456,58 @@ def test_manager_return_none_raises():
         pm._build("bad")
 
 
+def _make_list_manager():
+    """Build a manager with two sets (one extending the other) for --list tests."""
+    pm = ParameterSetManager()
+
+    @pm.add
+    def base(ps):
+        ps.add("G1", {"a": ParameterSet.arange(3), "b": ParameterSet.iter([10, 20])})
+        ps.add("G2", {"c": 99})
+        return ps
+
+    @pm.add(extends=base)
+    def child(ps):
+        ps.add("G3", {"d": 1})
+        return ps
+
+    return pm
+
+
+@sc.timer()
+def test_list_bare(capsys, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["sim.py"])
+    pm = _make_list_manager()
+    result = pm.run(argv=["--list", "-p", "base"])
+    assert result is None
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == [
+        "sim.py (2 parameter sets)",
+        "├── base (2 groups, 7 jobs)",
+        "│   ├── G1: 6",
+        "│   └── G2: 1",
+        "└── child (3 groups, 8 jobs, extends base)",
+        "    ├── G1: 6",
+        "    ├── G2: 1",
+        "    └── G3: 1",
+    ]
+
+
+@sc.timer()
+def test_list_single(capsys, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["sim.py"])
+    pm = _make_list_manager()
+    result = pm.run(argv=["--list", "base", "-p", "base"])
+    assert result is None
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "base (2 groups, 7 jobs)"
+    assert lines[1] == "├── G1: 6"
+    assert lines[2] == "└── G2: 1"
+    assert len(lines) == 3
+
+
 if __name__ == "__main__":
     T = sc.timer()
 
@@ -486,5 +538,7 @@ if __name__ == "__main__":
     test_manager_zero_arg_builder()
     test_manager_extend_chain()
     test_manager_return_none_raises()
+    test_list_bare(None, None)
+    test_list_single(None, None)
 
     T.toc()

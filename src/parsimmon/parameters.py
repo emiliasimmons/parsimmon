@@ -16,6 +16,7 @@ import concurrent.futures
 import inspect
 import itertools
 import math
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple
@@ -501,11 +502,12 @@ class ParameterSetManager:
             dest="print_pars",
             help="Print parameter dicts and exit",
         )
-        parser.add_argument("--count", action="store_true", help="Print sim count and exit")
         parser.add_argument(
             "--list",
-            action="store_true",
-            help="List registered parameter sets and exit",
+            nargs="?",
+            const=True,
+            default=None,
+            help="List parameter sets, or show group breakdown for a given set",
         )
         parser.add_argument("--no-plot", action="store_true", help="Skip post-run analysis/plotting")
 
@@ -515,19 +517,46 @@ class ParameterSetManager:
         args = parser.parse_args(argv)
         self.args = args
 
-        if args.list:
-            for entry_name in self._entries:
-                count = len(self._build(entry_name))
-                star = "*" if entry_name == default else " "
-                print(f"{star}{entry_name} {count}")
+        if args.list is not None:
+            single = args.list is not True
+            if single:
+                if args.list not in self._entries:
+                    parser.error(f"unknown parameter set: {args.list!r}")
+                entries = [args.list]
+            else:
+                entries = list(self._entries.keys())
+                filename = Path(sys.argv[0]).name
+                n_sets = len(entries)
+                sets_label = "parameter set" if n_sets == 1 else "parameter sets"
+                print(f"{filename} ({n_sets} {sets_label})")
+
+            for i, entry_name in enumerate(entries):
+                ps_entry = self._build(entry_name)
+                groups = ps_entry.groups
+                counts = [ps_entry._count(ps_entry._merged(g)) for g in groups]
+                total = sum(counts)
+                n_groups = len(groups)
+                g_label = "group" if n_groups == 1 else "groups"
+                j_label = "job" if total == 1 else "jobs"
+                parent = self._entries[entry_name].parent_name
+                extends = f", extends {parent}" if parent else ""
+
+                if single:
+                    entry_pre, child_pre = "", ""
+                else:
+                    last = i == len(entries) - 1
+                    entry_pre = "└── " if last else "├── "
+                    child_pre = "    " if last else "│   "
+
+                print(f"{entry_pre}{entry_name} ({n_groups} {g_label}, {total} {j_label}{extends})")
+                for j, (g, c) in enumerate(zip(groups, counts)):
+                    g_con = "└── " if j == len(groups) - 1 else "├── "
+                    print(f"{child_pre}{g_con}{g}: {c}")
+
             return None
 
         name = args.parameter_set
         ps = self._build(name, cli_overrides=args.args or None)
-
-        if args.count:
-            print(len(ps))
-            return None
 
         if args.print_pars:
             ps.print_summary()
