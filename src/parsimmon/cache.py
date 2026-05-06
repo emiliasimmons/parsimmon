@@ -1,5 +1,6 @@
 """Content-addressed caching for parsimmon simulation runs."""
 
+import abc
 import ast
 import copy
 import hashlib
@@ -11,39 +12,42 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import dill
 import numpy as np
-import sciris as sc
+
+
+def _dill_save(filepath, obj):
+    with open(filepath, "wb") as f:
+        dill.dump(obj, f)
+
+
+def _dill_load(filepath):
+    with open(filepath, "rb") as f:
+        return dill.load(f)
 
 
 def _make_default_serializers():
-    return (
-        lambda path, obj: sc.save(str(path), obj, verbose=False),
-        lambda path: sc.load(str(path)),
-    )
+    return _dill_save, _dill_load
 
 
-def _canonical_repr(obj, _seen=None):
-    """Build deterministic bytes for hashing; circular references become a
-    stable sentinel via the _seen id set rather than recursing infinitely."""
-    if _seen is None:
-        _seen = set()
-
+def _canonical_repr_inner(obj, seen):
+    """Build deterministic bytes for hashing (recursive helper)."""
     obj_id = id(obj)
     # only track mutable containers that can be circular
     is_container = isinstance(obj, (dict, list, tuple))
     if is_container:
-        if obj_id in _seen:
+        if obj_id in seen:
             return b"<circular>"
-        _seen.add(obj_id)
+        seen.add(obj_id)
 
     try:
         if isinstance(obj, dict):
             items = sorted(obj.items(), key=lambda kv: repr(kv[0]))
             parts = [b"dict:{"]
             for k, v in items:
-                parts.append(_canonical_repr(k, _seen))
+                parts.append(_canonical_repr_inner(k, seen))
                 parts.append(b":")
-                parts.append(_canonical_repr(v, _seen))
+                parts.append(_canonical_repr_inner(v, seen))
                 parts.append(b",")
             parts.append(b"}")
             return b"".join(parts)
@@ -53,7 +57,7 @@ def _canonical_repr(obj, _seen=None):
             close = b"]" if isinstance(obj, list) else b")"
             parts = [tag]
             for item in obj:
-                parts.append(_canonical_repr(item, _seen))
+                parts.append(_canonical_repr_inner(item, seen))
                 parts.append(b",")
             parts.append(close)
             return b"".join(parts)
@@ -62,15 +66,13 @@ def _canonical_repr(obj, _seen=None):
             header = f"ndarray:{obj.dtype}:{obj.shape}:".encode()
             return header + obj.tobytes()
 
-        # normalize numpy scalars so np.float64(1.0) hashes the same as float(1.0)
-        if isinstance(obj, np.integer):
+        if isinstance(obj, np.bool_):
+            obj = bool(obj)
+        elif isinstance(obj, np.integer):
             obj = int(obj)
         elif isinstance(obj, np.floating):
             obj = float(obj)
-        elif isinstance(obj, np.bool_):
-            obj = bool(obj)
 
-        # bool before int because bool is a subclass of int
         if isinstance(obj, bool):
             return f"bool:{obj!r}".encode()
         if isinstance(obj, int):
@@ -91,38 +93,27 @@ def _canonical_repr(obj, _seen=None):
                 f"and resolve it to the callable in your own code."
             )
 
-        # general fallback: accept any type whose repr is stable across copies
+        # fallback: accept any type whose repr is stable across copies
+        tname = type(obj).__name__
         r = repr(obj)
         if "0x" in r:
-            raise TypeError(
-                f"Cannot hash object of type {type(obj).__name__} for caching: "
-                f"repr contains a memory address, so the cache key would not "
-                f"be stable across sessions."
-            )
+            raise TypeError(f"Cannot hash {tname} for caching: repr contains a memory address")
         try:
-            obj2 = copy.deepcopy(obj)
-        except (TypeError, RecursionError, ValueError):
-            raise TypeError(
-                f"Cannot hash object of type {type(obj).__name__} for caching: "
-                f"deepcopy failed, so repr stability cannot be verified."
-            )
-        try:
-            r2 = repr(obj2)
-        except (TypeError, AttributeError, RuntimeError):
-            raise TypeError(
-                f"Cannot hash object of type {type(obj).__name__} for caching: "
-                f"repr failed on the copied object, so repr stability cannot be verified."
-            )
+            r2 = repr(copy.deepcopy(obj))
+        except (TypeError, RecursionError, ValueError, AttributeError, RuntimeError):
+            raise TypeError(f"Cannot hash {tname} for caching: deepcopy or repr failed")
         if r != r2:
-            raise TypeError(
-                f"Cannot hash object of type {type(obj).__name__} for caching: "
-                f"repr is not stable across copies ({r!r} != {r2!r})."
-            )
+            raise TypeError(f"Cannot hash {tname} for caching: repr is not stable across copies ({r!r} != {r2!r})")
         return f"obj:{r}".encode()
 
     finally:
         if is_container:
-            _seen.discard(obj_id)
+            seen.discard(obj_id)
+
+
+def _canonical_repr(obj):
+    """Build deterministic bytes for hashing."""
+    return _canonical_repr_inner(obj, set())
 
 
 def hash_params(pars: dict) -> str:
@@ -131,8 +122,6 @@ def hash_params(pars: dict) -> str:
 
 
 def compute_cache_key(pars: dict) -> str:
-    # 16 hex chars: short enough for filenames, collision-safe for any
-    # realistic parameter space
     return hash_params(pars)[:16]
 
 
@@ -151,8 +140,6 @@ def is_project_local(module_path: Path, project_root: Path) -> bool:
 
 
 def find_project_root(start: Path) -> Path:
-    # .git as root marker so the hash boundary matches version control;
-    # falls back to parent of start for notebooks / test scripts
     current = start.resolve()
     for parent in [current, *current.parents]:
         if (parent / ".git").exists():
@@ -161,7 +148,6 @@ def find_project_root(start: Path) -> Path:
 
 
 def _fn_referenced_names(fn: Callable) -> set[str]:
-    """Return the set of global names referenced in *fn*'s body."""
     try:
         src = inspect.getsource(fn)
     except (OSError, TypeError):
@@ -180,13 +166,7 @@ def _fn_referenced_names(fn: Callable) -> set[str]:
 
 
 def _resolve_fn_source_files(fn: Callable) -> list[Path]:
-    """Find project-local source files that *fn* depends on at runtime.
-
-    Walks *fn*'s AST for referenced names, resolves them through
-    ``fn.__globals__`` to real objects, then uses
-    ``inspect.getsourcefile`` to locate the file each lives in.
-    Returns only project-local files, excluding *fn*'s own module.
-    """
+    """Find project-local source files that *fn* depends on at runtime."""
     names = _fn_referenced_names(fn)
     fn_file = inspect.getsourcefile(fn)
     fn_globals = getattr(fn, "__globals__", {})
@@ -207,7 +187,6 @@ def _resolve_fn_source_files(fn: Callable) -> list[Path]:
         path_str = str(path)
         if "/site-packages/" in path_str or "\\site-packages\\" in path_str:
             continue
-        # skip fn's own file (the driver)
         if fn_file and Path(fn_file).resolve() == path.resolve():
             continue
 
@@ -216,13 +195,7 @@ def _resolve_fn_source_files(fn: Callable) -> list[Path]:
 
 
 def hash_function_chain(fn: Callable) -> str:
-    """Content hash of the project-local files that *fn* depends on.
-
-    Walks *fn*'s body to discover the globals it references, resolves
-    them to source files, then transitively follows project-local
-    imports.  Hashes raw file contents so any edit (including
-    whitespace / comments) invalidates the cache.
-    """
+    """Content hash of the project-local files that *fn* depends on."""
     seed_files = _resolve_fn_source_files(fn)
 
     if not seed_files:
@@ -236,7 +209,7 @@ def hash_function_chain(fn: Callable) -> str:
     fn_file = inspect.getsourcefile(fn)
     project_root = find_project_root(Path(fn_file)) if fn_file else Path.cwd()
 
-    collected: dict[str, bytes] = {}  # abs_path -> raw content
+    collected: dict[str, bytes] = {}
     for seed in seed_files:
         _collect_local_files(seed, project_root, collected, seen=set())
 
@@ -245,7 +218,6 @@ def hash_function_chain(fn: Callable) -> str:
 
 
 def _collect_local_files(file_path: Path, project_root: Path, collected: dict, seen: set) -> None:
-    """Recursively gather raw contents of *file_path* and its project-local imports."""
     abs_path = str(file_path.resolve())
     if abs_path in seen:
         return
@@ -275,9 +247,7 @@ def _collect_local_files(file_path: Path, project_root: Path, collected: dict, s
 def _resolve_import_node(node: ast.AST, project_root: Path) -> "Path | None":
     if isinstance(node, ast.Import):
         names = [alias.name for alias in node.names]
-    elif isinstance(node, ast.ImportFrom):
-        if node.module is None:
-            return None
+    elif isinstance(node, ast.ImportFrom) and node.module is not None:
         names = [node.module]
     else:
         return None
@@ -287,10 +257,8 @@ def _resolve_import_node(node: ast.AST, project_root: Path) -> "Path | None":
             spec = importlib.util.find_spec(name)
         except (ModuleNotFoundError, ValueError):
             continue
-
         if spec is None or spec.origin is None:
             continue
-
         candidate = Path(spec.origin)
         if candidate.suffix == ".py" and is_project_local(candidate, project_root):
             return candidate
@@ -298,30 +266,61 @@ def _resolve_import_node(node: ast.AST, project_root: Path) -> "Path | None":
     return None
 
 
-class SimCacheBase:
-    def save(self, cache_key: str, result: Any, metadata: dict) -> None:
-        raise NotImplementedError
+class SimCacheBase(abc.ABC):
+    @abc.abstractmethod
+    def save(self, cache_key: str, result: Any, metadata: dict) -> None: ...
 
-    def load(self, cache_key: str) -> Any:
-        raise NotImplementedError
+    @abc.abstractmethod
+    def load(self, cache_key: str) -> Any: ...
 
-    def exists(self, cache_key: str) -> bool:
-        raise NotImplementedError
+    @abc.abstractmethod
+    def exists(self, cache_key: str) -> bool: ...
 
-    def index(self) -> list[dict]:
-        raise NotImplementedError
+    @abc.abstractmethod
+    def index(self) -> list[dict]: ...
 
-    def add_index_entry(self, metadata: dict) -> None:
-        raise NotImplementedError
+    @abc.abstractmethod
+    def add_index_entry(self, metadata: dict) -> None: ...
 
-    def keys(self) -> list[str]:
-        raise NotImplementedError
+    @abc.abstractmethod
+    def keys(self) -> list[str]: ...
 
-    def delete(self, cache_key: str) -> None:
-        raise NotImplementedError
+    @abc.abstractmethod
+    def delete(self, cache_key: str) -> None: ...
 
-    def clear(self) -> None:
-        raise NotImplementedError
+    @abc.abstractmethod
+    def clear(self) -> None: ...
+
+    def certify_entries(self, keys: list[str]) -> int:
+        """Mark each entry in *keys* as certified by reloading and re-saving its index info."""
+        count = 0
+        for key in keys:
+            entries = self.index()
+            for entry in entries:
+                if entry.get("cache_key") == key:
+                    entry["certified"] = True
+                    self.add_index_entry(entry)
+                    count += 1
+                    break
+        return count
+
+    def clean_entries(self, keys: list[str]) -> int:
+        """Delete each entry in *keys* from the cache."""
+        count = 0
+        for key in keys:
+            self.delete(key)
+            count += 1
+        return count
+
+    def remove_orphans(self) -> int:
+        """Delete stored entries whose cache key is not present in the index."""
+        indexed_keys = {e.get("cache_key") for e in self.index()}
+        orphans = 0
+        for key in self.keys():
+            if key not in indexed_keys:
+                self.delete(key)
+                orphans += 1
+        return orphans
 
 
 class SimFileCache(SimCacheBase):
@@ -351,15 +350,15 @@ class SimFileCache(SimCacheBase):
         return self._results_dir / f"{cache_key}.pkl"
 
     def _read_index(self) -> list[dict]:
-        if self._index_cache is not None:
-            return self._index_cache
-        if not self._index_path.exists():
-            self._index_cache = []
-            return self._index_cache
-        self._index_cache = self._load(str(self._index_path))
+        if self._index_cache is None:
+            if self._index_path.exists():
+                self._index_cache = self._load(str(self._index_path))
+            else:
+                self._index_cache = []
         return self._index_cache
 
     def _write_index(self, entries: list[dict]) -> None:
+        self._ensure_dirs()
         tmp = self._index_path.with_suffix(".cache.tmp")
         self._save(str(tmp), entries)
         os.replace(str(tmp), str(self._index_path))
@@ -369,7 +368,6 @@ class SimFileCache(SimCacheBase):
         return self._result_path(cache_key).exists()
 
     def save(self, cache_key: str, result: Any, metadata: dict) -> None:
-        # content-addressed: existing file is canonical by definition, skip overwrite
         self._ensure_dirs()
         path = self._result_path(cache_key)
         if not path.exists():
@@ -383,9 +381,6 @@ class SimFileCache(SimCacheBase):
         return self._load(str(path))
 
     def add_index_entry(self, metadata: dict) -> None:
-        # supports cross-set deduplication: register an index entry for a
-        # result already cached by another parameter set without duplicating
-        # the file
         entries = self._read_index()
         entry = {
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
@@ -398,8 +393,6 @@ class SimFileCache(SimCacheBase):
         return list(self._read_index())
 
     def keys(self) -> list[str]:
-        # derived from filenames, not the index, so it reflects actual disk
-        # state even if the index is stale
         if not self._results_dir.exists():
             return []
         return [p.stem for p in self._results_dir.glob("*.pkl")]
@@ -423,8 +416,55 @@ class SimFileCache(SimCacheBase):
         self._index_cache = None
 
     def get_fn_hash(self, cache_key: str) -> "str | None":
-        # scan in reverse to return the most recent entry for this key
         for entry in reversed(self._read_index()):
             if entry.get("cache_key") == cache_key:
                 return entry.get("fn_hash")
         return None
+
+    def certify_entries(self, new_fn_hash: str, parameter_set: "str | None" = None) -> int:
+        entries = self._read_index()
+        count = 0
+        for entry in entries:
+            if parameter_set is not None and entry.get("parameter_set") != parameter_set:
+                continue
+            if entry.get("fn_hash") != new_fn_hash:
+                entry["fn_hash"] = new_fn_hash
+                count += 1
+        if count:
+            self._write_index(entries)
+        return count
+
+    def clean_entries(
+        self,
+        current_fn_hash: "str | None" = None,
+        parameter_set: "str | None" = None,
+        remove_all: bool = False,
+    ) -> int:
+        entries = self._read_index()
+        to_keep, removed = [], 0
+        for entry in entries:
+            if parameter_set is not None and entry.get("parameter_set") != parameter_set:
+                to_keep.append(entry)
+                continue
+            if remove_all or (current_fn_hash and entry.get("fn_hash") != current_fn_hash):
+                ck = entry.get("cache_key")
+                if ck:
+                    path = self._result_path(ck)
+                    if path.exists():
+                        path.unlink()
+                removed += 1
+            else:
+                to_keep.append(entry)
+        self._write_index(to_keep)
+        return removed
+
+    def remove_orphans(self) -> int:
+        if not self._results_dir.exists():
+            return 0
+        indexed_keys = {e.get("cache_key") for e in self._read_index()}
+        orphans = 0
+        for p in self._results_dir.glob("*.pkl"):
+            if p.stem not in indexed_keys:
+                p.unlink()
+                orphans += 1
+        return orphans

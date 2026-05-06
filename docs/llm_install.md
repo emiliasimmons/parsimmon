@@ -1,175 +1,210 @@
 # parsimmon -- LLM-Guided Setup
 
-Copy this to your coding agent (Claude Code, Codex, etc.):
+You are helping a user integrate **parsimmon** into their simulation project.
+Follow these steps in order. Do not skip steps.
 
-```
-Fetch and follow the instructions at <REPO_URL>/blob/main/llm_install.md
-```
-
----
-
-## Instructions
-
-You are helping a user integrate parsimmon into their simulation project.
-Follow these steps in order. Do not skip steps. Ask the user when decisions
-are needed.
+For full API documentation, see the `README.md` in the parsimmon repository.
 
 ---
 
-### Step 1: Determine install method
+## Step 1: Install
 
-Ask the user how they want to install parsimmon:
+Verify the user is in a virtual environment before installing. If they are on
+system Python, warn them and get explicit confirmation before proceeding.
 
-- **pip + git** (recommended): `pip install git+<REPO_URL>.git`
-- **Clone locally**: `git clone <REPO_URL>` and add to `sys.path` or install with `pip install -e .`
+Install parsimmon:
 
-Before installing, check whether the user is inside a virtual environment:
-
-- Run `python -c "import sys; print(sys.prefix, sys.base_prefix)"` and compare the two values.
-- If they match, the user is on a system Python. Do not install without explicit confirmation.
-  Warn them: "You are not in a virtual environment. Installing into system Python can break other
-  tools. Options: create and activate a venv first, or proceed anyway (not recommended)."
-- If they don't match, proceed with the install.
-
-Install parsimmon using the chosen method. Confirm the install succeeded by running:
-
-```
-python -c "from parsimmon import ParameterSetManager; print('ok')"
+```bash
+pip install git+https://github.com/InstituteforDiseaseModeling/parsimmon.git
 ```
 
-If the import fails, surface the error and resolve it before continuing.
+Confirm:
+
+```bash
+python -c "from parsimmon import Manager; print('ok')"
+```
+
+If the import fails, resolve the error before continuing.
 
 ---
 
-### Step 2: Verify git state
+## Step 2: Git safety
 
-Run `git status` in the user's project root.
-
-**If the project is a git repository and the working tree is dirty** (modified files,
-staged changes, or untracked files that look significant):
-
-- Stop. Do not modify any files yet.
-- Show the user the status output and ask them to choose one of:
-  - "Let me handle it" -- pause here; the user will clean up manually. Re-run `git status`
-    after they say they are done, and repeat this check until the tree is clean.
-  - "Stash my changes" -- run `git stash` and confirm with `git status`.
-  - "Commit current changes" -- ask the user for a commit message, then run
-    `git add -A && git commit -m "<their message>"`.
-- After any of the above actions, re-run `git status`. Do not proceed until the working
-  tree is clean (or the user has explicitly acknowledged they want to proceed dirty).
-
-**If the directory is not a git repository**:
-
-- Warn the user: "This project is not tracked by git. Without version control, changes
-  made during setup cannot be easily reviewed or reverted."
-- Ask whether to: run `git init && git add -A && git commit -m "initial commit"` to
-  initialize tracking, or proceed without version control.
+Run `git status` in the project root. If the working tree is dirty, stop and
+help the user commit or stash before making any changes. If the directory is
+not a git repository, warn the user that changes cannot be easily reverted and
+offer to initialize one.
 
 ---
 
-### Step 3: Evaluate project structure
+## Step 3: Understand the separation
 
-Scan the project. Look for:
+Parsimmon requires a clean separation between two sides:
 
-- How simulations are defined: simulation setup functions, parameter dictionaries,
-  config files, dataclasses, or similar structures.
-- How simulations are executed: runner scripts, notebooks, CLI entry points, `if __name__ == '__main__'` blocks.
-- Where parameters live: inline constants, dedicated config modules, scattered across
-  multiple files.
-- Where analysis and plotting happen: post-run scripts, functions that consume results,
-  figure-generation code.
-- What simulation framework is in use, if any (e.g., a custom loop, a third-party
-  library, or framework-agnostic code).
+### Hashed side (invalidates cache when changed)
 
-Summarize your findings to the user:
+The **simulation function** and everything it imports from within the project.
+This is the function passed to `Manager(fn)`. Its signature:
 
-- Which files contain simulation logic.
-- Which files contain parameters or configuration.
-- Which files contain analysis or plotting.
-- Any ambiguities or questions about structure.
+```python
+def fn(pars: dict, metadata: dict) -> result:
+    ...
+```
 
-Ask clarifying questions before continuing if the structure is unclear or the boundaries
-between parameter definition, simulation logic, and analysis are not obvious.
+`pars` is the fully resolved parameter dictionary for one trial.
+`metadata` contains `study`, `branch`, `sim_id`, and `branch_id`.
+
+Parsimmon computes an `fn_hash` from the AST of this function and all
+project-local modules it imports, recursively. If any of that code changes,
+cached results are detected as stale. This is the hashed boundary.
+
+### Unhashed side (safe to change freely)
+
+Everything else: driver files, parameter definitions, study configuration,
+analysis functions, plotting code. Changes to these do not invalidate cached
+results.
+
+### Default parameters
+
+A function that returns the full default parameter dictionary. This can live:
+
+- **In the model file** (recommended) -- changes to defaults invalidate the
+  cache, which is usually what you want.
+- **In the driver file** -- defaults don't affect cache validity.
+- **In a dedicated parameters file** -- same as driver unless the model
+  imports it.
+
+The placement depends on whether the user wants default changes to trigger
+re-runs. Ask them.
+
+### Driver files
+
+A driver file creates a `Manager`, defines studies, and runs them. A project
+can have multiple driver files (e.g. `calibration.py`, `sensitivity.py`,
+`validation.py`) that all import the same simulation function. The canonical
+pattern:
+
+```python
+import parsimmon as psm
+from model import run, default_pars
+
+pm = psm.Manager(run, cache=True)
+
+def base():
+    return default_pars(
+        sim={"n_agents": 5_000, "rand_seed": psm.arange(5)},
+        flags={"verbose": False},
+    )
+
+@pm.study(extends=base)
+def experiment(st):
+    st.branch("Control",   {"treatment": False})
+    st.branch("Treatment", {"treatment": True, "dose": psm.linspace(0.1, 1.0, 5)})
+    return st
+
+@experiment.analysis
+def plot_results(results):
+    for branch_name, group in results.branches.items():
+        print(f"{branch_name}: {len(group)} runs")
+
+if __name__ == "__main__":
+    pm.cli_run(jobs=4)
+```
+
+### Parameter types
+
+When caching is enabled, every value in the parameter dictionary must be
+**reproducible** -- parsimmon hashes parameters to compute cache keys. The
+following types are supported:
+
+- `dict` (any nesting depth, order-independent)
+- `list`, `tuple`
+- `np.ndarray` (dtype + shape + bytes)
+- `int`, `float`, `bool`, `str`, `None`, `bytes`
+- numpy scalars (`np.int64`, `np.float64`, etc. -- coerced to Python types)
+
+The following are **rejected with a `TypeError`**:
+
+- Callables (functions, lambdas, `functools.partial`, classes with `__call__`)
+- Objects whose `repr()` contains a memory address (`0x...`)
+- Objects that cannot be deepcopied (file handles, locks, generators)
+- Objects whose repr is not stable across copies (RNG state, mutable singletons)
+
+If the user's parameters contain any of these, they need to be refactored:
+replace callables with names/flags that resolve to the callable inside the
+simulation function; replace RNG objects with integer seeds.
+
+### Caching
+
+Recommend `cache=True`. It stores results under `data/cache/` by default,
+deduplicates across studies with identical parameters, and detects staleness
+via `fn_hash`. The user can always run with `-f` to force re-runs or disable
+caching entirely. See the README for custom serialization and cache backends.
 
 ---
 
-### Step 4: Plan the separation
+## Step 4: Explore and interview
 
-**Core principle:** parameters and analysis must be separate from simulation
-creation and execution logic.
+Before making any changes, explore the user's project and interview them
+relentlessly about every aspect of the integration until you reach a shared
+understanding. Walk through each branch of the refactoring decisions, resolving
+dependencies below one at a time. For each question, explain **why** it matters
+and provide your recommended answer based on what you've seen in the code. If
+a question can be answered by reading the project, read the project instead of
+asking.
 
-- **Simulation logic** is the function that takes parameters and produces results.
-  In parsimmon, this is the `fn` argument passed to `pm.run(fn)`. Its signature is:
-  ```python
-  def fn(pars: dict, metadata: dict) -> result:
-      ...
-  ```
-  `pars` is the fully resolved parameter dictionary for one simulation point.
-  `metadata` contains `parameter_set`, `group`, `sim_id`, `group_id`, and `label`.
+Do not proceed to implementation until all of these are resolved:
 
-- **Parameters** are defined using the `@pm.add` decorator on builder functions that
-  return a `ParameterSet` or a plain `dict`. Groups of override parameters are added
-  with `ps.add('GroupName', {...})`. Ranges for Cartesian expansion are created with
-  `ParameterSet.arange(...)`, `.linspace(...)`, `.logspace(...)`, or `.iter(...)`.
+1. **What is the simulation function?** Which function or method is the core
+   simulation logic? What does it accept and return? Does it need to be wrapped
+   to match the `fn(pars, metadata)` signature? If the project has multiple
+   simulation functions, recommend consolidating them into a single
+   parameter-driven function where a flag or parameter selects the behavior.
+   This is the parsimmon model: one simulation function, many parameter
+   configurations. That said, different driver files *can* use different
+   simulation functions with separate `Manager` instances, so if consolidation
+   doesn't make sense, work with the user to decide which function each driver
+   should use.
 
-- **Analysis** functions are registered with `@pm.analysis('ParameterSetName')` and
-  receive a `SimResult` scoped to their parameter set after `pm.run()` completes.
+2. **What are the parameters?** Where do defaults live now -- inline constants,
+   config dicts, dataclasses, config files? Do any parameter values contain
+   non-reproducible types (callables, RNG objects, objects with identity-based
+   repr)? These must be refactored before caching will work.
 
-If your coding agent supports a plan mode or task-planning interface, switch to it now.
+3. **What is the import graph?** What does the simulation function import from
+   within the project? All of those modules are inside the hashed boundary --
+   changes to any of them invalidate the cache. Are there modules currently
+   imported by the simulation function that should not be (analysis code,
+   plotting utilities, parameter definitions that should live outside the
+   boundary)?
 
-Produce a written plan that covers:
+4. **Where does analysis and plotting live?** These must stay outside the
+   hashed boundary. Are there analysis functions tangled into the simulation
+   module that need to be extracted?
 
-1. Which code is simulation logic vs. parameter definition vs. analysis.
-2. Where each piece should live after the refactor. Adapt to the user's existing
-   directory structure. Do not impose a new layout unless the user's project has no
-   clear structure.
-3. How to wrap the existing simulation logic in a function with the signature
-   `fn(pars: dict, metadata: dict) -> result`.
-4. How to construct a `ParameterSetManager` and define parameter sets with `@pm.add`
-   that reproduce the user's current parameter configurations.
-5. Whether to enable caching. Recommend `cache=True` if the simulations are expensive
-   and deterministic. With caching, results are stored in `data/cache/` by default and
-   shared across parameter sets that overlap in parameter values.
-6. Any other notable changes (file splits, renamed variables, imports to add or remove).
+5. **Where should default parameters live?** In the model file (recommended --
+   changes invalidate cache), in the driver file, or in a separate module?
+   Does the user want default changes to trigger re-runs?
 
-Present the plan to the user and get explicit approval before making any changes.
+6. **How many driver files?** Does the project have one entry point or several
+   (calibration, sensitivity analysis, validation, etc.)? Each can be a
+   separate driver file sharing the same simulation function.
+
+7. **Layout preferences.** Adapt to the user's existing directory structure. Do
+   not impose a new layout unless their project has no clear structure or they
+   ask for one.
 
 ---
 
-### Step 5: Implement
+## Step 5: Implement
 
-Execute the approved plan:
+Execute the agreed-upon plan:
 
-1. Make the changes described in the plan. Work file by file; do not scatter unrelated
-   edits across a large diff.
-2. After all changes are made, run any existing tests in the project:
-   ```
-   python -m pytest      # or the project's test command
-   ```
-   If tests fail due to the integration, fix them before proceeding.
-3. Run a minimal end-to-end example to confirm parsimmon is working:
-   ```python
-   # example -- adapt to the user's actual sim function and parameters
-    from parsimmon import ParameterSetManager, ParameterSet
-
-   pm = ParameterSetManager()
-
-   @pm.add
-   def baseline():
-       ps = ParameterSet()
-       ps.add('Default', {'param': 1.0})
-       return ps
-
-   def run_sim(pars: dict, metadata: dict):
-       # replace with a call to the user's actual simulation logic
-       return {'result': pars['param'] * 2}
-
-   results = pm.run(run_sim)
-   print(results)
-   for r in results:
-       print(r)
-   ```
-4. Show the user the output and confirm the integration is working as expected.
-
-For full documentation on `ParameterSet`, `ParameterSetManager`, `SimResult`, caching,
-and custom backends, see `README.md` in the parsimmon repository.
+1. Work file by file. Do not scatter unrelated edits across a large diff.
+2. After all changes, run any existing tests (`python -m pytest` or the
+   project's test command). Fix failures before proceeding.
+3. Run `python <driver_file> --list` for each driver file to verify studies
+   are registered and expand correctly.
+4. Do a single trial run to confirm the simulation function works with the
+   parsimmon signature.
+5. Show the user the output and confirm the integration is working.

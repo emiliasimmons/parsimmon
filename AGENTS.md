@@ -8,16 +8,19 @@ Python library for parameter and simulation management. Built with hatchling, de
 - Lint fix: `ruff check --fix src tests`
 
 ## Testing
-- Framework: pytest, tests in `tests/`. No fixtures or conftest.
-- Three test modules mirror source: `test_parameters.py`, `test_cache.py`, `test_results.py`.
+- Framework: pytest, tests in `tests/`.
+- Four test modules: `test_parameters.py` (Study + Manager), `test_cache.py`, `test_results.py`, `test_cache_integration.py`.
+- Shared fixtures in `conftest.py`.
 
 ## Code conventions
 - Ruff enforces style; config in `.ruff.toml` (line-length 120, preview mode).
 
 ## Architecture pointers
 - Public API surface: `src/parsimmon/__init__.py`
+- Core classes: `Manager` (manager.py), `Study` + `Trial` (study.py), `Results` (results.py)
+- Supporting modules: `ranges.py` (range helpers), `_utils.py` (shared internal helpers), `cache.py`
 - Full API docs and usage examples: `README.md`
-- LLM integration guide for downstream projects: `llm_install.md`
+- LLM integration guide for downstream projects: `docs/llm_install.md`
 
 ## Git workflow
 Conventional commits: `feat:`, `fix:`, `chore:`, breaking changes use `!` suffix (e.g. `rm!:`).

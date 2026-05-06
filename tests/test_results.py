@@ -1,485 +1,535 @@
-from pathlib import Path
-from unittest.mock import MagicMock
+import pickle
 
 import pytest
-import sciris as sc
 
+from parsimmon._utils import objdict
 from parsimmon.cache import SimFileCache
-from parsimmon.results import SimResult, _SimEntry
+from parsimmon.results import Results
 
 
-def _make_result(groups_spec):
+def _make_result(branches_spec):
     values = []
     metadata_list = []
     sim_id = 1
-    for group_name, count, pars in groups_spec:
-        for group_id in range(1, count + 1):
+    for branch_name, count, pars in branches_spec:
+        for branch_id in range(1, count + 1):
             values.append({"value": sim_id})
             metadata_list.append({
                 "parameter_set": "test_set",
-                "group": group_name,
+                "branch": branch_name,
                 "sim_id": sim_id,
-                "group_id": group_id,
-                "pars": sc.objdict(pars),
+                "branch_id": branch_id,
+                "pars": objdict(pars),
             })
             sim_id += 1
-    return SimResult.from_values(values, metadata_list)
+    return Results(_values=(metadata_list, values))
 
 
-def _make_lazy_entry(metadata, return_value=None):
-    mock_backend = MagicMock()
-    mock_backend.load.return_value = return_value if return_value is not None else {"result": 42}
-    entry = _SimEntry(
-        metadata=metadata,
-        cache_key="abc123",
-        backend=mock_backend,
-    )
-    return entry, mock_backend
+def _pkl_save(path, obj):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
 
 
-@sc.timer()
+def _pkl_load(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Retained tests (adapted)
+# ---------------------------------------------------------------------------
+
+
 def test_iter_and_len():
     sr = _make_result([("Baseline", 3, {"beta": 0.5})])
-
-    assert len(sr) == 3, f"Expected len 3, got {len(sr)}"
-
+    assert len(sr) == 3
     values = list(sr)
-    assert len(values) == 3, f"Expected 3 items from iteration, got {len(values)}"
-
+    assert len(values) == 3
     for i, v in enumerate(values, start=1):
-        assert isinstance(v, dict), f"Expected dict value, got {type(v)}"
-        assert v["value"] == i, f"Expected value {i}, got {v['value']}"
+        assert v["value"] == i
 
 
-@sc.timer()
-def test_getitem_int():
-    sr = _make_result([("A", 3, {"x": 1})])
-
-    assert sr[0] == {"value": 1}, f"sr[0] should be first value, got {sr[0]}"
-    assert sr[1] == {"value": 2}, f"sr[1] should be second value, got {sr[1]}"
-    assert sr[2] == {"value": 3}, f"sr[2] should be third value, got {sr[2]}"
-    assert sr[-1] == {"value": 3}, f"sr[-1] should be last value, got {sr[-1]}"
-
-
-@sc.timer()
 def test_getitem_slice():
     sr = _make_result([("A", 5, {"x": 1})])
-
     sliced = sr[1:4]
-    assert isinstance(sliced, SimResult), f"Slice should return SimResult, got {type(sliced)}"
-    assert len(sliced) == 3, f"Slice [1:4] of 5 should have len 3, got {len(sliced)}"
-
-    sliced2 = sr[:2]
-    assert len(sliced2) == 2, f"Slice [:2] should have len 2, got {len(sliced2)}"
-
-    values = list(sliced)
-    assert values[0] == {"value": 2}, f"First sliced value should be 2, got {values[0]}"
+    assert isinstance(sliced, Results)
+    assert len(sliced) == 3
+    assert next(iter(sliced)) == {"value": 2}
 
 
-@sc.timer()
 def test_bool():
-    empty = SimResult([])
-    assert not empty, "Empty SimResult should be falsy"
-
-    non_empty = _make_result([("A", 1, {})])
-    assert non_empty, "Non-empty SimResult should be truthy"
+    assert not Results([])
+    assert _make_result([("A", 1, {})])
 
 
-@sc.timer()
-def test_attr_group_access():
-    sr = _make_result([
-        ("Baseline", 2, {"beta": 0.5}),
-        ("Treatment", 3, {"beta": 0.8}),
-    ])
-
-    baseline = sr.Baseline
-    assert isinstance(baseline, SimResult), f"Expected SimResult, got {type(baseline)}"
-    assert len(baseline) == 2, f"Expected 2 Baseline entries, got {len(baseline)}"
-
-    treatment = sr.Treatment
-    assert len(treatment) == 3, f"Expected 3 Treatment entries, got {len(treatment)}"
-
-    for meta in baseline.metadata:
-        assert meta["group"] == "Baseline", f"Expected group 'Baseline', got {meta['group']}"
+def test_attr_branch_access():
+    sr = _make_result([("Baseline", 2, {"beta": 0.5}), ("Treatment", 3, {"beta": 0.8})])
+    assert len(sr.Baseline) == 2
+    assert len(sr.Treatment) == 3
+    # Use iter_params instead of .metadata
+    assert all(meta["branch"] == "Baseline" for _pars, meta in sr.Baseline.iter_params())
 
 
-@sc.timer()
-def test_attr_parameter_set_access():
-    values = [{"v": i} for i in range(4)]
-    metadata_list = [
-        {"parameter_set": "set_A", "group": "Control", "sim_id": 1, "group_id": 1, "pars": sc.objdict({})},
-        {"parameter_set": "set_A", "group": "Control", "sim_id": 2, "group_id": 2, "pars": sc.objdict({})},
-        {"parameter_set": "set_B", "group": "Control", "sim_id": 3, "group_id": 1, "pars": sc.objdict({})},
-        {"parameter_set": "set_B", "group": "Control", "sim_id": 4, "group_id": 2, "pars": sc.objdict({})},
-    ]
-    sr = SimResult.from_values(values, metadata_list)
-
-    set_a = sr.set_A
-    assert isinstance(set_a, SimResult), f"Expected SimResult, got {type(set_a)}"
-    assert len(set_a) == 2, f"Expected 2 entries in set_A, got {len(set_a)}"
-
-    set_b = sr.set_B
-    assert len(set_b) == 2, f"Expected 2 entries in set_B, got {len(set_b)}"
-
-    for meta in set_a.metadata:
-        assert meta["parameter_set"] == "set_A", f"Expected set_A, got {meta['parameter_set']}"
+def test_branches_property():
+    sr = _make_result([("Baseline", 2, {"beta": 0.5}), ("Treatment", 3, {"beta": 0.8})])
+    branches = sr.branches
+    assert set(branches) == {"Baseline", "Treatment"}
+    assert len(branches["Baseline"]) == 2
+    assert len(branches["Treatment"]) == 3
 
 
-@sc.timer()
-def test_attr_chained():
-    values = [{"v": i} for i in range(4)]
-    metadata_list = [
-        {"parameter_set": "tipping_point", "group": "Baseline", "sim_id": 1, "group_id": 1, "pars": sc.objdict({})},
-        {"parameter_set": "tipping_point", "group": "Baseline", "sim_id": 2, "group_id": 2, "pars": sc.objdict({})},
-        {"parameter_set": "control", "group": "Baseline", "sim_id": 3, "group_id": 1, "pars": sc.objdict({})},
-        {"parameter_set": "control", "group": "Baseline", "sim_id": 4, "group_id": 2, "pars": sc.objdict({})},
-    ]
-    sr = SimResult.from_values(values, metadata_list)
-
-    chained = sr.tipping_point.Baseline
-    assert isinstance(chained, SimResult), f"Expected SimResult, got {type(chained)}"
-    assert len(chained) == 2, f"Expected 2 entries after chaining, got {len(chained)}"
-
-    for meta in chained.metadata:
-        assert meta["parameter_set"] == "tipping_point"
-        assert meta["group"] == "Baseline"
-
-
-@sc.timer()
-def test_attr_missing_raises():
-    sr = _make_result([("Baseline", 2, {})])
-
-    with pytest.raises(AttributeError, match="no attribute 'NonExistent'"):
-        _ = sr.NonExistent
-
-    with pytest.raises(AttributeError, match="Baseline"):
-        _ = sr.NonExistent
-
-
-@sc.timer()
-def test_groups_property():
-    sr = _make_result([
-        ("Baseline", 2, {"beta": 0.5}),
-        ("Treatment", 3, {"beta": 0.8}),
-    ])
-
-    groups = sr.groups
-    assert "Baseline" in groups, f"Expected 'Baseline' in groups, got {list(groups.keys())}"
-    assert "Treatment" in groups, f"Expected 'Treatment' in groups, got {list(groups.keys())}"
-
-    assert isinstance(groups["Baseline"], SimResult)
-    assert isinstance(groups["Treatment"], SimResult)
-    assert len(groups["Baseline"]) == 2, f"Expected 2, got {len(groups['Baseline'])}"
-    assert len(groups["Treatment"]) == 3, f"Expected 3, got {len(groups['Treatment'])}"
-
-    total = sum(len(v) for v in groups.values())
-    assert total == len(sr), f"Groups total {total} != original len {len(sr)}"
-
-
-@sc.timer()
-def test_group_by_key():
-    sr = _make_result([
-        ("A", 2, {"beta": 0.5}),
-        ("B", 3, {"beta": 0.8}),
-    ])
-
-    grouped = sr.group("beta")
-    assert 0.5 in grouped, f"Expected key 0.5 in grouped, got {list(grouped.keys())}"
-    assert 0.8 in grouped, f"Expected key 0.8 in grouped, got {list(grouped.keys())}"
-    assert len(grouped[0.5]) == 2, f"Expected 2 entries for beta=0.5, got {len(grouped[0.5])}"
-    assert len(grouped[0.8]) == 3, f"Expected 3 entries for beta=0.8, got {len(grouped[0.8])}"
-
-
-@sc.timer()
-def test_group_nested_key():
-    values = [{"v": i} for i in range(4)]
-    metadata_list = [
-        {"parameter_set": "test_set", "group": "A", "sim_id": 1, "group_id": 1, "pars": {"model": {"rate": 0.1}}},
-        {"parameter_set": "test_set", "group": "A", "sim_id": 2, "group_id": 2, "pars": {"model": {"rate": 0.1}}},
-        {"parameter_set": "test_set", "group": "B", "sim_id": 3, "group_id": 1, "pars": {"model": {"rate": 0.9}}},
-        {"parameter_set": "test_set", "group": "B", "sim_id": 4, "group_id": 2, "pars": {"model": {"rate": 0.9}}},
-    ]
-    sr = SimResult.from_values(values, metadata_list)
-
-    grouped = sr.group("model.rate")
-    assert 0.1 in grouped, f"Expected 0.1 in grouped, got {list(grouped.keys())}"
-    assert 0.9 in grouped, f"Expected 0.9 in grouped, got {list(grouped.keys())}"
-    assert len(grouped[0.1]) == 2
-    assert len(grouped[0.9]) == 2
-
-
-@sc.timer()
-def test_filter_by_key_value():
-    sr = _make_result([
-        ("A", 2, {"beta": 0.5}),
-        ("B", 3, {"beta": 0.8}),
-    ])
-
-    filtered = sr.filter("beta", 0.5)
-    assert isinstance(filtered, SimResult)
-    assert len(filtered) == 2, f"Expected 2 filtered entries, got {len(filtered)}"
-
-    for meta in filtered.metadata:
-        assert meta["pars"]["beta"] == 0.5, f"Unexpected beta: {meta['pars']['beta']}"
-
-
-@sc.timer()
-def test_filter_by_dotted_key():
-    values = [{"v": i} for i in range(4)]
-    metadata_list = [
-        {"parameter_set": "test_set", "group": "A", "sim_id": 1, "group_id": 1, "pars": {"model": {"rate": 0.1}}},
-        {"parameter_set": "test_set", "group": "A", "sim_id": 2, "group_id": 2, "pars": {"model": {"rate": 0.5}}},
-        {"parameter_set": "test_set", "group": "B", "sim_id": 3, "group_id": 1, "pars": {"model": {"rate": 0.1}}},
-        {"parameter_set": "test_set", "group": "B", "sim_id": 4, "group_id": 2, "pars": {"model": {"rate": 0.5}}},
-    ]
-    sr = SimResult.from_values(values, metadata_list)
-
-    filtered = sr.filter("model.rate", 0.1)
-    assert len(filtered) == 2, f"Expected 2, got {len(filtered)}"
-
-    for meta in filtered.metadata:
-        assert meta["pars"]["model"]["rate"] == 0.1
-
-
-@sc.timer()
-def test_filter_by_metadata_key():
-    sr = _make_result([
-        ("Baseline", 2, {"x": 1}),
-        ("Treatment", 3, {"x": 2}),
-    ])
-
-    filtered = sr.filter("group", "Baseline")
-    assert len(filtered) == 2, f"Expected 2, got {len(filtered)}"
-
-    for meta in filtered.metadata:
-        assert meta["group"] == "Baseline"
-
-
-@sc.timer()
 def test_filter_by_predicate():
-    sr = _make_result([
-        ("Low", 2, {"beta": 0.1}),
-        ("High", 3, {"beta": 0.8}),
-    ])
-
+    sr = _make_result([("Low", 2, {"beta": 0.1}), ("High", 3, {"beta": 0.8})])
     filtered = sr.filter(lambda pars, meta: pars["beta"] > 0.3)
-    assert len(filtered) == 3, f"Expected 3, got {len(filtered)}"
-
-    for meta in filtered.metadata:
-        assert meta["pars"]["beta"] > 0.3
-
-    filtered2 = sr.filter(lambda pars, meta: meta["group"] == "Low" and pars["beta"] < 0.5)
-    assert len(filtered2) == 2
+    assert len(filtered) == 3
 
 
-@sc.timer()
-def test_pars_property():
-    sr = _make_result([
-        ("A", 2, {"alpha": 0.1, "beta": 0.5}),
-        ("B", 1, {"alpha": 0.2, "beta": 0.8}),
-    ])
+def test_from_cache(tmp_path):
+    cache = SimFileCache(tmp_path, save=_pkl_save, load=_pkl_load)
+    for i, key in enumerate(["key001", "key002", "key003"], start=1):
+        cache.save(key, {"result": i}, {"branch": "Baseline", "pars": {"beta": 0.5}})
 
-    pars = sr.pars
-    assert isinstance(pars, list), f"Expected list, got {type(pars)}"
-    assert len(pars) == 3, f"Expected 3 pars dicts, got {len(pars)}"
+    sr = Results(tmp_path)
+    assert len(sr) == 3
+    (_pars, _meta), val = sr.first()
+    assert val == {"result": 1}
 
-    assert pars[0]["beta"] == 0.5
-    assert pars[1]["beta"] == 0.5
-    assert pars[2]["beta"] == 0.8
+    sr2 = Results(cache)
+    assert len(sr2) == 3
 
 
-@sc.timer()
-def test_metadata_property():
-    sr = _make_result([
-        ("Baseline", 2, {"beta": 0.5}),
-    ])
-
-    metadata = sr.metadata
-    assert isinstance(metadata, list)
-    assert len(metadata) == 2
-
-    for i, meta in enumerate(metadata, start=1):
-        assert "group" in meta
-        assert "sim_id" in meta
-        assert "pars" in meta
-        assert meta["group"] == "Baseline"
-        assert meta["sim_id"] == i
-
-
-@sc.timer()
-def test_lazy_no_load_on_filter():
-    entry1, mock1 = _make_lazy_entry({"group": "A", "pars": {"x": 1}})
-    entry2, mock2 = _make_lazy_entry({"group": "B", "pars": {"x": 2}})
-    sr = SimResult([entry1, entry2])
-
-    _ = sr.filter("group", "A")
-
-    mock1.load.assert_not_called()
-    mock2.load.assert_not_called()
-
-
-@sc.timer()
-def test_lazy_no_load_on_groups():
-    entry1, mock1 = _make_lazy_entry({"group": "A", "pars": {"x": 1}})
-    entry2, mock2 = _make_lazy_entry({"group": "B", "pars": {"x": 2}})
-    sr = SimResult([entry1, entry2])
-
-    _ = sr.groups
-
-    mock1.load.assert_not_called()
-    mock2.load.assert_not_called()
-
-
-@sc.timer()
-def test_lazy_no_load_on_pars():
-    entry1, mock1 = _make_lazy_entry({"group": "A", "pars": {"x": 1}})
-    entry2, mock2 = _make_lazy_entry({"group": "B", "pars": {"x": 2}})
-    sr = SimResult([entry1, entry2])
-
-    _ = sr.pars
-
-    mock1.load.assert_not_called()
-    mock2.load.assert_not_called()
-
-
-@sc.timer()
-def test_lazy_loads_on_iter():
-    entry1, mock1 = _make_lazy_entry({"group": "A", "pars": {"x": 1}}, return_value={"result": 10})
-    entry2, mock2 = _make_lazy_entry({"group": "B", "pars": {"x": 2}}, return_value={"result": 20})
-    sr = SimResult([entry1, entry2])
-
-    values = list(sr)
-
-    mock1.load.assert_called_once_with("abc123")
-    mock2.load.assert_called_once_with("abc123")
-    assert values == [{"result": 10}, {"result": 20}], f"Unexpected values: {values}"
-
-
-@sc.timer()
-def test_lazy_loads_on_getitem_int():
-    entry1, mock1 = _make_lazy_entry({"group": "A", "pars": {"x": 1}}, return_value={"result": 99})
-    entry2, mock2 = _make_lazy_entry({"group": "B", "pars": {"x": 2}}, return_value={"result": 77})
-    sr = SimResult([entry1, entry2])
-
-    val = sr[0]
-
-    mock1.load.assert_called_once_with("abc123")
-    mock2.load.assert_not_called()
-    assert val == {"result": 99}, f"Unexpected value: {val}"
-
-
-@sc.timer()
-def test_from_cache_file_path(tmp_path):
-    cache = SimFileCache(tmp_path)
-    import pickle
-
-    def pkl_save(path, obj):
-        with open(path, "wb") as f:
-            pickle.dump(obj, f)
-
-    def pkl_load(path):
-        with open(path, "rb") as f:
-            return pickle.load(f)
-
-    cache._save = pkl_save
-    cache._load = pkl_load
-
-    cache.save("key001", {"result": 1}, {"group": "Baseline", "pars": {"beta": 0.5}})
-    cache.save("key002", {"result": 2}, {"group": "Baseline", "pars": {"beta": 0.5}})
-    cache.save("key003", {"result": 3}, {"group": "Treatment", "pars": {"beta": 0.8}})
-
-    sr = SimResult.from_cache(tmp_path)
-    assert len(sr) == 3, f"Expected 3 entries, got {len(sr)}"
-
-    val = sr[0]
-    assert val == {"result": 1}, f"Unexpected value: {val}"
-
-
-@sc.timer()
-def test_from_cache_backend_instance(tmp_path):
-    import pickle
-
-    def pkl_save(path, obj):
-        with open(path, "wb") as f:
-            pickle.dump(obj, f)
-
-    def pkl_load(path):
-        with open(path, "rb") as f:
-            return pickle.load(f)
-
-    cache = SimFileCache(tmp_path, save=pkl_save, load=pkl_load)
-    cache.save("keyA", {"sim": "A"}, {"group": "Alpha", "pars": {"rate": 0.1}})
-    cache.save("keyB", {"sim": "B"}, {"group": "Beta", "pars": {"rate": 0.9}})
-
-    sr = SimResult.from_cache(cache)
-    assert len(sr) == 2, f"Expected 2 entries, got {len(sr)}"
-
-    vals = list(sr)
-    assert len(vals) == 2, f"Expected 2 values from iteration, got {len(vals)}"
-
-
-@sc.timer()
 def test_repr():
-    sr = _make_result([
-        ("Baseline", 2, {}),
-        ("Treatment", 3, {}),
-    ])
-
+    sr = _make_result([("Baseline", 2, {}), ("Treatment", 3, {})])
     r = repr(sr)
-    assert "SimResult" in r, f"repr should mention SimResult: {r!r}"
-    assert "n=5" in r, f"repr should show n=5: {r!r}"
-    assert "Baseline" in r, f"repr should mention 'Baseline': {r!r}"
-    assert "Treatment" in r, f"repr should mention 'Treatment': {r!r}"
-
-    empty_repr = repr(SimResult([]))
-    assert "n=0" in empty_repr, f"Empty repr should show n=0: {empty_repr!r}"
+    assert "Results" in r
+    assert "n=5" in r
+    assert "Baseline" in r
+    assert "n=0" in repr(Results([]))
 
 
-@sc.timer()
-def test_from_values_length_mismatch():
+def test_constructor_length_mismatch():
     with pytest.raises(ValueError, match="same length"):
-        SimResult.from_values([1, 2, 3], [{"a": 1}, {"b": 2}])
+        Results(_values=([{"a": 1}, {"b": 2}], [1, 2, 3]))
 
-    with pytest.raises(ValueError, match="same length"):
-        SimResult.from_values([], [{"a": 1}])
 
-    sr = SimResult.from_values([1, 2], [{"x": 1}, {"x": 2}])
+# ---------------------------------------------------------------------------
+# P query builder tests
+# ---------------------------------------------------------------------------
+
+
+def test_P_unique():
+    sr = _make_result([("A", 2, {"beta": 0.5}), ("B", 3, {"beta": 0.8})])
+    unique_betas = sr.P.beta.unique()
+    assert unique_betas == [0.5, 0.8]
+
+
+def test_P_unique_nested():
+    values = [{"v": i} for i in range(4)]
+    metadata_list = [
+        {
+            "parameter_set": "test_set",
+            "branch": g,
+            "sim_id": i + 1,
+            "branch_id": (i % 2) + 1,
+            "pars": objdict({"model": {"rate": r}}),
+        }
+        for i, (g, r) in enumerate([("A", 0.1), ("A", 0.1), ("B", 0.9), ("B", 0.5)])
+    ]
+    sr = Results(_values=(metadata_list, values))
+    unique_rates = sr.P.model.rate.unique()
+    assert unique_rates == [0.1, 0.5, 0.9]
+
+
+def test_P_eq():
+    sr = _make_result([("A", 2, {"beta": 0.5}), ("B", 3, {"beta": 0.8})])
+    fn = sr.P.beta == 0.5
+    # The filter fn is callable
+    pars_match = objdict({"beta": 0.5})
+    pars_no_match = objdict({"beta": 0.8})
+    assert fn(pars_match, {}) is True
+    assert fn(pars_no_match, {}) is False
+
+
+def test_P_gt_lt_ge_le_ne():
+    sr = _make_result([("A", 1, {"beta": 0.5})])
+    pars = objdict({"beta": 0.5})
+    meta = {}
+
+    assert (sr.P.beta > 0.3)(pars, meta) is True
+    assert (sr.P.beta > 0.5)(pars, meta) is False
+    assert (sr.P.beta < 0.9)(pars, meta) is True
+    assert (sr.P.beta < 0.5)(pars, meta) is False
+    assert (sr.P.beta >= 0.5)(pars, meta) is True
+    assert (sr.P.beta >= 0.6)(pars, meta) is False
+    assert (sr.P.beta <= 0.5)(pars, meta) is True
+    assert (sr.P.beta <= 0.4)(pars, meta) is False
+    assert (sr.P.beta != 0.5)(pars, meta) is False
+    assert (sr.P.beta != 0.9)(pars, meta) is True
+
+
+def test_P_and():
+    sr = _make_result([("A", 1, {"beta": 0.5})])
+    f1 = sr.P.beta > 0.3
+    f2 = sr.P.beta < 0.9
+    combined = f1 & f2
+    pars = objdict({"beta": 0.5})
+    assert combined(pars, {}) is True
+    assert (f1 & (sr.P.beta > 0.9))(pars, {}) is False
+    # _expr propagates
+    assert ">" in combined._expr
+    assert "<" in combined._expr
+
+
+def test_P_or():
+    sr = _make_result([("A", 1, {"beta": 0.5})])
+    f1 = sr.P.beta < 0.3
+    f2 = sr.P.beta > 0.9
+    combined = f1 | f2
+    pars_low = objdict({"beta": 0.1})
+    pars_mid = objdict({"beta": 0.5})
+    pars_high = objdict({"beta": 0.95})
+    assert combined(pars_low, {}) is True
+    assert combined(pars_mid, {}) is False
+    assert combined(pars_high, {}) is True
+    assert "<" in combined._expr
+    assert ">" in combined._expr
+
+
+def test_P_nested_composition():
+    sr = _make_result([("A", 1, {"beta": 0.5})])
+    f1 = sr.P.beta > 0.3
+    f2 = sr.P.beta < 0.9
+    f3 = sr.P.beta < 0.2
+    composed = (f1 & f2) | f3
+    pars_match = objdict({"beta": 0.5})
+    pars_low = objdict({"beta": 0.1})
+    pars_high = objdict({"beta": 0.95})
+    assert composed(pars_match, {}) is True
+    assert composed(pars_low, {}) is True
+    assert composed(pars_high, {}) is False
+
+
+def test_P_dir():
+    sr = _make_result([("A", 2, {"beta": 0.5, "alpha": 0.1})])
+    keys = dir(sr.P)
+    assert "beta" in keys
+    assert "alpha" in keys
+    # Should not contain non-pars keys
+    assert "branch" not in keys
+
+
+def test_P_expr_tag():
+    sr = _make_result([("A", 1, {"beta": 0.5})])
+    fn = sr.P.beta == 0.5
+    assert hasattr(fn, "_expr")
+    assert "beta" in fn._expr
+    assert "0.5" in fn._expr
+
+
+def test_P_is_property():
+    sr = _make_result([("A", 1, {"beta": 0.5})])
+    # Each access returns a new _BoundField instance
+    assert sr.P is not sr.P
+
+
+# ---------------------------------------------------------------------------
+# Filter tests
+# ---------------------------------------------------------------------------
+
+
+def test_filter_P_expression():
+    sr = _make_result([("A", 2, {"beta": 0.5}), ("B", 3, {"beta": 0.8})])
+    filtered = sr.filter(sr.P.beta == 0.5)
+    assert len(filtered) == 2
+    for pars, _meta in filtered.iter_params():
+        assert pars["beta"] == 0.5
+
+
+def test_filter_P_composed():
+    sr = _make_result([("Low", 2, {"beta": 0.1}), ("Mid", 2, {"beta": 0.5}), ("High", 3, {"beta": 0.8})])
+    filtered = sr.filter((sr.P.beta > 0.3) & (sr.P.beta < 0.9))
+    assert len(filtered) == 5  # Mid(2) + High(3)
+
+
+def test_filter_lambda_no_expr():
+    sr = _make_result([("A", 2, {"beta": 0.5})])
+    filtered = sr.filter(lambda pars, meta: pars["beta"] == 0.5)
+    assert filtered._filter_expr is None
+
+
+# ---------------------------------------------------------------------------
+# Expression tracking in repr
+# ---------------------------------------------------------------------------
+
+
+def test_repr_with_filter_expr():
+    sr = _make_result([("A", 2, {"beta": 0.5}), ("B", 3, {"beta": 0.8})])
+    filtered = sr.filter(sr.P.beta == 0.5)
+    r = repr(filtered)
+    assert "filter=" in r
+    assert "beta" in r
+
+
+def test_repr_no_filter_expr():
+    sr = _make_result([("A", 2, {"beta": 0.5})])
+    # No filter applied
+    assert "filter=" not in repr(sr)
+    # Lambda filter has no expr
+    filtered = sr.filter(lambda pars, meta: True)
+    assert "filter=" not in repr(filtered)
+
+
+# ---------------------------------------------------------------------------
+# Groupby tests
+# ---------------------------------------------------------------------------
+
+
+def test_groupby_single_key():
+    sr = _make_result([("A", 2, {"beta": 0.5}), ("B", 3, {"beta": 0.8})])
+    groups = list(sr.groupby("beta"))
+    # sorted by key
+    assert groups[0][0] == 0.5
+    assert len(groups[0][1]) == 2
+    assert groups[1][0] == 0.8
+    assert len(groups[1][1]) == 3
+    # Values are Results instances
+    assert isinstance(groups[0][1], Results)
+
+
+def test_groupby_multi_key():
+    sr = _make_result([("A", 1, {"beta": 0.5, "alpha": 0.1}), ("B", 1, {"beta": 0.8, "alpha": 0.2})])
+    groups = list(sr.groupby("beta", "alpha"))
+    assert all(isinstance(k, tuple) and len(k) == 2 for k, _ in groups)
+    keys = [k for k, _ in groups]
+    assert (0.5, 0.1) in keys
+    assert (0.8, 0.2) in keys
+
+
+def test_groupby_P_field():
+    sr = _make_result([("A", 2, {"beta": 0.5}), ("B", 3, {"beta": 0.8})])
+    groups = list(sr.groupby(sr.P.beta))
+    assert len(groups) == 2
+    assert groups[0][0] == 0.5
+    assert groups[1][0] == 0.8
+
+
+def test_groupby_skips_empty():
+    sr = _make_result([("A", 2, {"beta": 0.5}), ("B", 3, {"beta": 0.8})])
+    # Filter first to ensure only one group remains
+    filtered = sr.filter(sr.P.beta == 0.5)
+    groups = list(filtered.groupby("beta"))
+    assert len(groups) == 1
+    assert groups[0][0] == 0.5
+
+
+def test_groupby_is_iterator():
+    sr = _make_result([("A", 2, {"beta": 0.5})])
+    result = sr.groupby("beta")
+    # It should be an iterator/generator, not a list or dict
+    import types
+
+    assert isinstance(result, types.GeneratorType)
+
+
+# ---------------------------------------------------------------------------
+# Navigation tests
+# ---------------------------------------------------------------------------
+
+
+def test_attr_study_access():
+    values = [{"v": i} for i in range(4)]
+    metadata_list = [
+        {
+            "parameter_set": ps,
+            "branch": "Control",
+            "sim_id": i + 1,
+            "branch_id": (i % 2) + 1,
+            "pars": objdict({}),
+        }
+        for i, ps in enumerate(["StudyA", "StudyA", "StudyB", "StudyB"])
+    ]
+    sr = Results(_values=(metadata_list, values))
+    assert len(sr.StudyA) == 2
+    assert len(sr.StudyB) == 2
+
+
+def test_attr_branch_after_study():
+    values = [{"v": i} for i in range(4)]
+    metadata_list = [
+        {
+            "parameter_set": ps,
+            "branch": br,
+            "sim_id": i + 1,
+            "branch_id": 1,
+            "pars": objdict({}),
+        }
+        for i, (ps, br) in enumerate([("StudyA", "Arm1"), ("StudyA", "Arm2"), ("StudyB", "Arm1"), ("StudyB", "Arm2")])
+    ]
+    sr = Results(_values=(metadata_list, values))
+    # Chain: study then branch
+    chained = sr.StudyA.Arm1
+    assert len(chained) == 1
+
+
+def test_attr_study_wins_collision():
+    """When name matches both study and branch, study wins silently."""
+    values = [{"v": i} for i in range(4)]
+    metadata_list = [
+        # Two different parameter_sets, one branch named "Baseline" in each
+        {"parameter_set": "Baseline", "branch": "Baseline", "sim_id": 1, "branch_id": 1, "pars": objdict({})},
+        {"parameter_set": "Baseline", "branch": "Treatment", "sim_id": 2, "branch_id": 1, "pars": objdict({})},
+        {"parameter_set": "Other", "branch": "Baseline", "sim_id": 3, "branch_id": 1, "pars": objdict({})},
+        {"parameter_set": "Other", "branch": "Control", "sim_id": 4, "branch_id": 1, "pars": objdict({})},
+    ]
+    sr = Results(_values=(metadata_list, values))
+    # "Baseline" matches both a parameter_set and a branch name;
+    # with multiple parameter_sets, study wins
+    result = sr.Baseline
+    # Should be filtered by parameter_set == "Baseline", giving 2 entries
+    assert len(result) == 2
+    for _pars, meta in result.iter_params():
+        assert meta["parameter_set"] == "Baseline"
+
+
+def test_studies_property():
+    values = [{"v": i} for i in range(4)]
+    metadata_list = [
+        {
+            "parameter_set": ps,
+            "branch": "Control",
+            "sim_id": i + 1,
+            "branch_id": 1,
+            "pars": objdict({}),
+        }
+        for i, ps in enumerate(["Alpha", "Alpha", "Beta", "Beta"])
+    ]
+    sr = Results(_values=(metadata_list, values))
+    studies = sr.studies
+    assert isinstance(studies, objdict)
+    assert set(studies.keys()) == {"Alpha", "Beta"}
+    assert isinstance(studies["Alpha"], Results)
+    assert len(studies["Alpha"]) == 2
+    assert len(studies["Beta"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Iteration tests
+# ---------------------------------------------------------------------------
+
+
+def test_items():
+    sr = _make_result([("Baseline", 2, {"beta": 0.5})])
+    items = list(sr.items())
+    assert len(items) == 2
+    (pars, meta), val = items[0]
+    # pars is the parameter dict
+    assert pars["beta"] == 0.5
+    # metadata does NOT contain a 'pars' key
+    assert "pars" not in meta
+    assert "branch" in meta
+    # value is loaded
+    assert val == {"value": 1}
+
+
+def test_iter_params():
+    sr = _make_result([("Baseline", 2, {"beta": 0.5})])
+    param_pairs = list(sr.iter_params())
+    assert len(param_pairs) == 2
+    for pars, meta in param_pairs:
+        assert pars["beta"] == 0.5
+        assert "pars" not in meta
+        assert "branch" in meta
+
+
+def test_first():
+    sr = _make_result([("Baseline", 3, {"beta": 0.5})])
+    (pars, meta), val = sr.first()
+    assert pars["beta"] == 0.5
+    assert meta["branch"] == "Baseline"
+    assert val == {"value": 1}
+
+
+def test_first_empty_raises():
+    sr = Results([])
+    with pytest.raises(IndexError):
+        sr.first()
+
+
+def test_metadata_split():
+    """metadata from iter_params/items has no 'pars' key; pars is the param dict."""
+    sr = _make_result([("A", 1, {"alpha": 0.1, "beta": 0.5})])
+    (pars, meta), _val = sr.first()
+    assert "pars" not in meta
+    assert "alpha" in pars
+    assert "beta" in pars
+    assert meta["branch"] == "A"
+
+
+# ---------------------------------------------------------------------------
+# Display tests
+# ---------------------------------------------------------------------------
+
+
+def test_repr_html():
+    sr = _make_result([("Baseline", 2, {"beta": 0.5}), ("Treatment", 3, {"beta": 0.8})])
+    html = sr._repr_html_()
+    assert isinstance(html, str)
+    assert len(html) > 0
+    # Contains the entry count
+    assert "5" in html
+
+
+# ---------------------------------------------------------------------------
+# Constructor tests
+# ---------------------------------------------------------------------------
+
+
+def test_constructor_path(tmp_path):
+    cache = SimFileCache(tmp_path, save=_pkl_save, load=_pkl_load)
+    for i, key in enumerate(["key001", "key002"], start=1):
+        cache.save(key, {"result": i}, {"branch": "B", "pars": {"x": i}})
+
+    sr = Results(str(tmp_path))
     assert len(sr) == 2
 
 
-if __name__ == "__main__":
-    T = sc.timer()
+def test_constructor_backend(tmp_path):
+    cache = SimFileCache(tmp_path, save=_pkl_save, load=_pkl_load)
+    for i, key in enumerate(["key001", "key002"], start=1):
+        cache.save(key, {"result": i}, {"branch": "B", "pars": {"x": i}})
 
-    test_iter_and_len()
-    test_getitem_int()
-    test_getitem_slice()
-    test_bool()
-    test_attr_group_access()
-    test_attr_parameter_set_access()
-    test_attr_chained()
-    test_attr_missing_raises()
-    test_groups_property()
-    test_group_by_key()
-    test_group_nested_key()
-    test_filter_by_key_value()
-    test_filter_by_dotted_key()
-    test_filter_by_metadata_key()
-    test_filter_by_predicate()
-    test_pars_property()
-    test_metadata_property()
-    test_lazy_no_load_on_filter()
-    test_lazy_no_load_on_groups()
-    test_lazy_no_load_on_pars()
-    test_lazy_loads_on_iter()
-    test_lazy_loads_on_getitem_int()
+    sr = Results(cache)
+    assert len(sr) == 2
 
-    import tempfile
 
-    with tempfile.TemporaryDirectory() as tmp:
-        test_from_cache_file_path(Path(tmp) / "cache1")
-        test_from_cache_backend_instance(Path(tmp) / "cache2")
+def test_constructor_values():
+    meta_list = [
+        {"parameter_set": "s", "branch": "B", "sim_id": 1, "branch_id": 1, "pars": objdict({"x": 1})},
+        {"parameter_set": "s", "branch": "B", "sim_id": 2, "branch_id": 2, "pars": objdict({"x": 2})},
+    ]
+    val_list = [{"v": 1}, {"v": 2}]
+    sr = Results(_values=(meta_list, val_list))
+    assert len(sr) == 2
 
-    test_repr()
-    test_from_values_length_mismatch()
 
-    T.toc()
+def test_constructor_empty():
+    sr = Results()
+    assert len(sr) == 0
+    assert not sr
+
+
+def test_getitem_int_raises():
+    sr = _make_result([("A", 3, {"x": 1})])
+    with pytest.raises(TypeError):
+        _ = sr[0]
+
+
+# ---------------------------------------------------------------------------
+# Missing attribute still raises
+# ---------------------------------------------------------------------------
+
+
+def test_attr_missing_raises():
+    sr = _make_result([("Baseline", 2, {})])
+    with pytest.raises(AttributeError, match="no attribute 'NonExistent'"):
+        _ = sr.NonExistent

@@ -1,15 +1,21 @@
 """parsimmon -- Parameter and Simulation Management."""
 
-from .cache import SimCacheBase, SimFileCache, compute_cache_key, hash_function_chain
-from .parameters import ParameterSet, ParameterSetManager
-from .results import SimResult
+from .cache import SimCacheBase, SimFileCache
+from .manager import Manager
+from .ranges import arange, each, link, linspace, logspace
+from .results import Results
+from .study import Study, Trial
 
 __all__ = [
-    "ParameterSet",
-    "ParameterSetManager",
+    "Manager",
+    "Results",
     "SimCacheBase",
     "SimFileCache",
-    "SimResult",
-    "compute_cache_key",
-    "hash_function_chain",
+    "Study",
+    "Trial",
+    "arange",
+    "each",
+    "link",
+    "linspace",
+    "logspace",
 ]

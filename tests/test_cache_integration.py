@@ -14,55 +14,55 @@ import warnings
 import parsimmon as pm
 from parsimmon.cache import hash_function_chain
 
-# ---------------------------------------------------------------------------
-# Inline helpers replacing external fixture files (drive_sim / sim_test)
-# ---------------------------------------------------------------------------
+
+def _run_sim(pars, metadata):
+    return {"status": "done", "value": 42}
 
 
-def _make_test_manager(cache_dir):
-    """Build a manager with two parameter sets for cache integration tests."""
-    manager = pm.ParameterSetManager(cache=pm.SimFileCache(cache_dir))
+def _make_manager(sim_fn, cache_dir):
+    manager = pm.Manager(sim_fn, cache=pm.SimFileCache(cache_dir))
 
-    @manager.add
+    @manager.study
     def experiment(ps):
-        ps.add("Control", {"beta": 0.1, "seed": 0})
-        ps.add("Treatment", {"beta": 0.5, "seed": 0})
+        ps.branch("Control", {"beta": 0.1, "seed": 0})
+        ps.branch("Treatment", {"beta": 0.5, "seed": 0})
         return ps
 
     return manager
 
 
-def _run_sim(pars, metadata):
-    """Minimal sim stub for basic cache tests."""
-    return {"status": "done", "value": 42}
+def _run_with_manager(cache_dir, sim_fn=_run_sim):
+    manager = _make_manager(sim_fn, cache_dir)
+    ps = manager._build("experiment")
+    return manager._execute("experiment", ps)
 
 
-# ---------------------------------------------------------------------------
-# Helpers to build a fake project in tmp_path with .git marker
-# ---------------------------------------------------------------------------
+def test_first_run_creates_cache(tmp_path):
+    cache_dir = tmp_path / "cache"
+    result = _run_with_manager(cache_dir)
+    assert len(list(result)) == 2
+    assert len(list((cache_dir / "results").glob("*.pkl"))) == 2
 
-SIM_HELPER_SRC = """\
-def setup(pars):
-    return pars
-"""
 
-PLOT_HELPER_SRC = """\
-def make_plot(results):
-    pass
-"""
+def test_second_run_uses_cache_no_warnings(tmp_path):
+    cache_dir = tmp_path / "cache"
+    _run_with_manager(cache_dir)
 
-SIM_FN_SRC = """\
-from sim_helper import setup
-import plot_helper
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = _run_with_manager(cache_dir)
 
-def run(pars, metadata):
-    setup(pars)
-    return {"status": "done", "value": 42}
-"""
+    fn_warnings = [w for w in caught if "function has changed" in str(w.message)]
+    assert fn_warnings == []
+    assert len(list(result)) == 2
+
+
+SIM_HELPER_SRC = "def setup(pars):\n    return pars\n"
+PLOT_HELPER_SRC = "def make_plot(results):\n    pass\n"
+SIM_FN_SRC = 'from sim_helper import setup\nimport plot_helper\n\ndef run(pars, metadata):\n    setup(pars)\n    return {"status": "done", "value": 42}\n'
 
 
 def _write_project(proj_dir, sim_fn_src=SIM_FN_SRC, sim_helper_src=SIM_HELPER_SRC, plot_helper_src=PLOT_HELPER_SRC):
-    """Write a minimal project with .git marker and three modules."""
     proj_dir.mkdir(parents=True, exist_ok=True)
     (proj_dir / ".git").mkdir(exist_ok=True)
     (proj_dir / "sim_fn.py").write_text(sim_fn_src)
@@ -74,15 +74,12 @@ def _load_run_fn(proj_dir):
     """Import the run function from the project's sim_fn.py.
 
     Registers the module in sys.modules so inspect.getmodule() works,
-    matching what happens when ``python basic.py`` runs (where the
-    script is __main__ with a __file__).
+    matching what happens when ``python basic.py`` runs.
     """
-    # ensure the project dir is on sys.path so local imports work
     str_dir = str(proj_dir)
     if str_dir not in sys.path:
         sys.path.insert(0, str_dir)
 
-    # force re-import of all project modules
     for mod_name in ("sim_fn", "sim_helper", "plot_helper"):
         sys.modules.pop(mod_name, None)
 
@@ -93,158 +90,56 @@ def _load_run_fn(proj_dir):
     return mod.run
 
 
-# ---------------------------------------------------------------------------
-# Simple same-code tests (baseline)
-# ---------------------------------------------------------------------------
-
-
-def _run_with_manager(cache_dir):
-    """Build manager, execute, return the SimResult."""
-    manager = _make_test_manager(cache_dir)
-    ps = manager._build("experiment")
-    return manager._execute("experiment", ps, _run_sim)
-
-
-def test_first_run_creates_cache(tmp_path):
-    cache_dir = tmp_path / "cache"
-    result = _run_with_manager(cache_dir)
-
-    assert len(list(result)) == 2, "Should have 2 results (one per group)"
-    assert (cache_dir / "results").exists(), "Cache results dir should exist"
-    assert len(list((cache_dir / "results").glob("*.pkl"))) == 2, "Should cache 2 result files"
-
-
-def test_second_run_uses_cache_no_warnings(tmp_path):
-    cache_dir = tmp_path / "cache"
-
-    # first run: populate cache
-    _run_with_manager(cache_dir)
-
-    # second run: should use cache with zero warnings
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        result = _run_with_manager(cache_dir)
-
-    fn_warnings = [w for w in caught if "function has changed" in str(w.message)]
-    assert fn_warnings == [], f"Expected no fn_hash warnings, got: {[str(w.message) for w in fn_warnings]}"
-    assert len(list(result)) == 2, "Should still return 2 results from cache"
-
-
-# ---------------------------------------------------------------------------
-# Cross-module fn_hash tests (reproduces hiv-instep-test structure)
-# ---------------------------------------------------------------------------
-
-
 def _run_project(proj_dir, cache_dir):
-    """Load the run fn from the project and execute via a manager."""
-    run_fn = _load_run_fn(proj_dir)
-    manager = pm.ParameterSetManager(cache=pm.SimFileCache(cache_dir))
+    return _run_with_manager(cache_dir, sim_fn=_load_run_fn(proj_dir))
 
-    @manager.add
-    def experiment(ps):
-        ps.add("Control", {"beta": 0.1, "seed": 0})
-        ps.add("Treatment", {"beta": 0.5, "seed": 0})
-        return ps
 
-    ps = manager._build("experiment")
-    return manager._execute("experiment", ps, run_fn)
+def _assert_no_fn_warnings(caught):
+    fn_warnings = [w for w in caught if "function has changed" in str(w.message)]
+    assert fn_warnings == [], f"Unexpected fn_hash warnings: {[str(w.message) for w in fn_warnings]}"
 
 
 def test_unchanged_code_no_warnings(tmp_path):
-    """Same code, two runs -> no warnings (reproduces the basic complaint)."""
-    proj_dir = tmp_path / "project"
-    cache_dir = tmp_path / "cache"
+    proj_dir, cache_dir = tmp_path / "project", tmp_path / "cache"
     _write_project(proj_dir)
-
-    # run 1: populate cache
     _run_project(proj_dir, cache_dir)
 
-    # run 2: identical code
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         _run_project(proj_dir, cache_dir)
-
-    fn_warnings = [w for w in caught if "function has changed" in str(w.message)]
-    assert fn_warnings == [], f"Unchanged code should not warn: {[str(w.message) for w in fn_warnings]}"
+    _assert_no_fn_warnings(caught)
 
 
 def test_plotting_change_no_warning(tmp_path):
-    """Changing plot_helper.py (irrelevant to sim) should NOT trigger a warning."""
-    proj_dir = tmp_path / "project"
-    cache_dir = tmp_path / "cache"
+    proj_dir, cache_dir = tmp_path / "project", tmp_path / "cache"
     _write_project(proj_dir)
-
-    # run 1: populate cache
     _run_project(proj_dir, cache_dir)
 
-    # modify plotting code (doesn't affect simulation results)
     (proj_dir / "plot_helper.py").write_text("def make_plot(results):\n    print('new plot')\n")
 
-    # run 2: should still use cache without warning
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         _run_project(proj_dir, cache_dir)
-
-    fn_warnings = [w for w in caught if "function has changed" in str(w.message)]
-    assert fn_warnings == [], f"Plotting change should not warn: {[str(w.message) for w in fn_warnings]}"
+    _assert_no_fn_warnings(caught)
 
 
 def test_sim_helper_change_invalidates(tmp_path):
-    """Changing sim_helper.py (used by the sim function) SHOULD invalidate."""
-    proj_dir = tmp_path / "project"
-    cache_dir = tmp_path / "cache"
+    proj_dir, cache_dir = tmp_path / "project", tmp_path / "cache"
     _write_project(proj_dir)
-
-    # run 1: populate cache
     _run_project(proj_dir, cache_dir)
 
-    # modify simulation logic
     (proj_dir / "sim_helper.py").write_text("def setup(pars):\n    pars['extra'] = True\n    return pars\n")
 
-    # run 2: should detect the change and re-run (not just warn)
     result = _run_project(proj_dir, cache_dir)
-    # At minimum, the system should notice the change.
-    # The exact behavior (warn vs re-run) depends on the fix,
-    # but the cache should not silently serve stale results.
     assert len(list(result)) == 2
 
 
-# ---------------------------------------------------------------------------
-# File-edit cache invalidation: sim_def + transitive dependency
-# ---------------------------------------------------------------------------
-#
-# Three generated modules form a chain:
-#   driver.py  -->  sim_def.py  -->  sim_dep.py  -->  sciris (site-packages)
-#
-# hash_function_chain(driver.run) hashes sim_def.py and sim_dep.py (sciris
-# is excluded as non-project-local).  Editing either file changes the hash,
-# causing the cache to invalidate and re-run.
-
-SIM_DEP_SRC = """\
-import sciris as sc
-
-def prepare(pars):
-    return sc.dcp(pars)
-"""
-
-SIM_DEF_SRC = """\
-from sim_dep import prepare
-
-def run_sim(pars, metadata):
-    prepared = prepare(pars)
-    return {"status": "done", "value": 42}
-"""
-
-DRIVER_SRC = """\
-from sim_def import run_sim
-
-def run(pars, metadata):
-    return run_sim(pars, metadata)
-"""
+SIM_DEP_SRC = "import copy\n\ndef prepare(pars):\n    return copy.deepcopy(pars)\n"
+SIM_DEF_SRC = 'from sim_dep import prepare\n\ndef run_sim(pars, metadata):\n    prepared = prepare(pars)\n    return {"status": "done", "value": 42}\n'
+DRIVER_SRC = "from sim_def import run_sim\n\ndef run(pars, metadata):\n    return run_sim(pars, metadata)\n"
 
 
 def _write_sim_project(proj_dir):
-    """Write sim_dep, sim_def, and driver modules with a .git marker."""
     proj_dir.mkdir(parents=True, exist_ok=True)
     (proj_dir / ".git").mkdir(exist_ok=True)
     (proj_dir / "sim_dep.py").write_text(SIM_DEP_SRC)
@@ -253,7 +148,6 @@ def _write_sim_project(proj_dir):
 
 
 def _load_driver(proj_dir):
-    """Import driver.run, forcing re-import of the whole sim chain."""
     str_dir = str(proj_dir)
     if str_dir not in sys.path:
         sys.path.insert(0, str_dir)
@@ -268,50 +162,36 @@ def _load_driver(proj_dir):
 
 
 def test_cache_invalidation_on_file_edit(tmp_path):
-    """Editing sim_def or its dependency invalidates; unchanged code is cached."""
-    proj_dir = tmp_path / "project"
-    cache_dir = tmp_path / "cache"
+    proj_dir, cache_dir = tmp_path / "project", tmp_path / "cache"
     _write_sim_project(proj_dir)
 
     def _run():
         run_fn = _load_driver(proj_dir)
         fn_hash = hash_function_chain(run_fn)
-        manager = pm.ParameterSetManager(cache=pm.SimFileCache(cache_dir))
-
-        @manager.add
-        def experiment(ps):
-            ps.add("Control", {"beta": 0.1, "seed": 0})
-            ps.add("Treatment", {"beta": 0.5, "seed": 0})
-            return ps
-
+        manager = _make_manager(run_fn, cache_dir)
         ps = manager._build("experiment")
-        result = manager._execute("experiment", ps, run_fn)
+        result = manager._execute("experiment", ps)
         return result, fn_hash
 
-    # first run: populates cache
     result, h1 = _run()
     assert len(list(result)) == 2
 
-    # unchanged code -> cache hit
-    result, h2 = _run()
-    assert len(list(result)) == 2
-    assert h2 == h1, "hash should be stable without edits"
+    # unchanged -> stable hash
+    _, h2 = _run()
+    assert h2 == h1
 
-    # edit sim_def.py -> hash changes -> re-run
+    # edit sim_def.py -> hash changes
     with open(proj_dir / "sim_def.py", "a") as f:
         f.write("\n# edited\n")
-    result, h3 = _run()
-    assert len(list(result)) == 2
-    assert h3 != h1, "hash should change after editing sim_def.py"
+    _, h3 = _run()
+    assert h3 != h1
 
-    # edit sim_dep.py -> hash changes -> re-run
+    # edit sim_dep.py -> hash changes again
     with open(proj_dir / "sim_dep.py", "a") as f:
         f.write("\n# edited\n")
-    result, h4 = _run()
-    assert len(list(result)) == 2
-    assert h4 != h3, "hash should change after editing sim_dep.py"
+    _, h4 = _run()
+    assert h4 != h3
 
-    # unchanged code -> cache hit
-    result, h5 = _run()
-    assert len(list(result)) == 2
-    assert h5 == h4, "hash should be stable without edits"
+    # stable again
+    _, h5 = _run()
+    assert h5 == h4
