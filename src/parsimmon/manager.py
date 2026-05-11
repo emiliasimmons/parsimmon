@@ -25,6 +25,20 @@ class _Entry(NamedTuple):
     parent: str | Callable | None = None
 
 
+def _worker_run_and_save(sim_fn, pars, fn_meta, cache, cache_key):
+    """Run one simulation inside a worker process, caching the result before returning.
+
+    Saves the result to disk (if a cache is provided) so the large object is freed
+    within the worker process rather than being pickled and sent back over IPC.
+    Returns (True, None) when saved, (False, result) when there is no cache.
+    """
+    result = sim_fn(pars, fn_meta)
+    if cache is not None and cache_key is not None:
+        cache.save_result(cache_key, result)
+        return True, None
+    return False, result
+
+
 class Manager:
     """Binds a simulation function to a registry of named parameter-set
     builders, with decorator API, CLI entry point, optional caching,
@@ -405,43 +419,38 @@ class Manager:
 
         return entries, to_run
 
-    def _run_simulations(self, to_run, sim_fn, jobs):
-        """Execute pending simulations, serially or in parallel.
+    def _save_entry(self, entries, entry_idx, entry_meta, cache_key, result):
+        """Persist a single result and install it in *entries*."""
+        from .results import _SimEntry
 
-        Returns a list of results in the same order as *to_run*.
-        """
+        if self._cache is not None and cache_key is not None:
+            self._cache.save(cache_key, result, entry_meta)
+            entry_meta["cache_key"] = cache_key
+            entries[entry_idx] = _SimEntry(
+                metadata=entry_meta,
+                cache_key=cache_key,
+                backend=self._cache,
+            )
+        else:
+            entries[entry_idx] = _SimEntry(metadata=entry_meta, value=result)
+
+    def _run_simulations(self, entries, to_run, sim_fn, jobs):
+        """Execute pending simulations and cache each result as it completes."""
         if jobs is not None and len(to_run) > 1:
             with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as executor:
                 future_map = {}
-                for run_idx, (_, pars, fn_meta, _, _) in enumerate(to_run):
-                    future = executor.submit(sim_fn, pars, fn_meta)
+                for run_idx, (_, pars, fn_meta, _, cache_key) in enumerate(to_run):
+                    future = executor.submit(_worker_run_and_save, sim_fn, pars, fn_meta, self._cache, cache_key)
                     future_map[future] = run_idx
-                ordered_results = [None] * len(to_run)
                 for future in concurrent.futures.as_completed(future_map):
-                    ordered_results[future_map[future]] = future.result()
+                    run_idx = future_map[future]
+                    entry_idx, _, _, entry_meta, cache_key = to_run[run_idx]
+                    _saved, result = future.result()
+                    # when saved in worker, result is None but save_result is idempotent
+                    self._save_entry(entries, entry_idx, entry_meta, cache_key, result)
         else:
-            ordered_results = [sim_fn(pars, fn_meta) for _, pars, fn_meta, _, _ in to_run]
-        return ordered_results
-
-    def _assemble_entries(self, entries, to_run, ordered_results):
-        """Fill the ``None`` placeholders in *entries* with fresh results.
-
-        Saves to cache when available and returns the completed entry list.
-        """
-        from .results import _SimEntry
-
-        for (entry_idx, _, _, entry_meta, cache_key), result in zip(to_run, ordered_results):
-            if self._cache is not None and cache_key is not None:
-                self._cache.save(cache_key, result, entry_meta)
-                entry_meta["cache_key"] = cache_key
-                entries[entry_idx] = _SimEntry(
-                    metadata=entry_meta,
-                    cache_key=cache_key,
-                    backend=self._cache,
-                )
-            else:
-                entries[entry_idx] = _SimEntry(metadata=entry_meta, value=result)
-        return entries
+            for entry_idx, pars, fn_meta, entry_meta, cache_key in to_run:
+                self._save_entry(entries, entry_idx, entry_meta, cache_key, sim_fn(pars, fn_meta))
 
     def _execute(self, name, ps, jobs=None, run_analysis=True, force=False):
         from .results import Results
@@ -479,8 +488,7 @@ class Manager:
             suffix = f" ({', '.join(parts)})" if parts else ""
             print(f"Running {len(to_run)} simulations{suffix}...")
 
-            ordered_results = self._run_simulations(to_run, fn, jobs)
-            self._assemble_entries(entries, to_run, ordered_results)
+            self._run_simulations(entries, to_run, fn, jobs)
         elif skip_run:
             print(f"Loaded {len(entries)} simulations from cache (skipping rerun).")
         else:

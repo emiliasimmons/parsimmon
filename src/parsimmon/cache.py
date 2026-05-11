@@ -271,6 +271,11 @@ class SimCacheBase(abc.ABC):
     def save(self, cache_key: str, result: Any, metadata: dict) -> None: ...
 
     @abc.abstractmethod
+    def save_result(self, cache_key: str, result: Any) -> None:
+        """Write result data only (idempotent); index registration is the caller's responsibility."""
+        ...
+
+    @abc.abstractmethod
     def load(self, cache_key: str) -> Any: ...
 
     @abc.abstractmethod
@@ -367,11 +372,14 @@ class SimFileCache(SimCacheBase):
     def exists(self, cache_key: str) -> bool:
         return self._result_path(cache_key).exists()
 
-    def save(self, cache_key: str, result: Any, metadata: dict) -> None:
+    def save_result(self, cache_key: str, result: Any) -> None:
         self._ensure_dirs()
         path = self._result_path(cache_key)
         if not path.exists():
             self._save(str(path), result)
+
+    def save(self, cache_key: str, result: Any, metadata: dict) -> None:
+        self.save_result(cache_key, result)
         self.add_index_entry({**metadata, "cache_key": cache_key})
 
     def load(self, cache_key: str) -> Any:
