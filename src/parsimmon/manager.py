@@ -6,6 +6,7 @@ import concurrent.futures
 import copy
 import inspect
 import re
+import signal
 import sys
 import warnings
 from collections.abc import Callable, Mapping
@@ -23,6 +24,11 @@ from .study import Study
 class _Entry(NamedTuple):
     builder: Callable
     parent: str | Callable | None = None
+
+
+def _init_worker():
+    """Ignore SIGINT in worker processes so Ctrl-C is handled only by the parent."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def _worker_run_and_save(sim_fn, pars, fn_meta, cache, cache_key):
@@ -437,17 +443,21 @@ class Manager:
     def _run_simulations(self, entries, to_run, sim_fn, jobs):
         """Execute pending simulations and cache each result as it completes."""
         if jobs is not None and len(to_run) > 1:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as executor:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=jobs, initializer=_init_worker) as executor:
                 future_map = {}
                 for run_idx, (_, pars, fn_meta, _, cache_key) in enumerate(to_run):
                     future = executor.submit(_worker_run_and_save, sim_fn, pars, fn_meta, self._cache, cache_key)
                     future_map[future] = run_idx
-                for future in concurrent.futures.as_completed(future_map):
-                    run_idx = future_map[future]
-                    entry_idx, _, _, entry_meta, cache_key = to_run[run_idx]
-                    _saved, result = future.result()
-                    # when saved in worker, result is None but save_result is idempotent
-                    self._save_entry(entries, entry_idx, entry_meta, cache_key, result)
+                try:
+                    for future in concurrent.futures.as_completed(future_map):
+                        run_idx = future_map[future]
+                        entry_idx, _, _, entry_meta, cache_key = to_run[run_idx]
+                        _saved, result = future.result()
+                        # when saved in worker, result is None but save_result is idempotent
+                        self._save_entry(entries, entry_idx, entry_meta, cache_key, result)
+                except KeyboardInterrupt:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
         else:
             for entry_idx, pars, fn_meta, entry_meta, cache_key in to_run:
                 self._save_entry(entries, entry_idx, entry_meta, cache_key, sim_fn(pars, fn_meta))
@@ -479,14 +489,15 @@ class Manager:
         entries, to_run = self._partition_cache(name, sim_points, fn_hash, force, skip_run, certify_run)
 
         if to_run:
-            n_cached = len(sim_points) - len(to_run)
+            n_total = len(sim_points)
+            n_cached = n_total - len(to_run)
             parts = []
             if n_cached > 0:
-                parts.append(f"{n_cached} cached")
+                parts.append(f"cached {n_cached}/{n_total}")
             if jobs is not None:
                 parts.append(f"{jobs} jobs")
             suffix = f" ({', '.join(parts)})" if parts else ""
-            print(f"Running {len(to_run)} simulations{suffix}...")
+            print(f"Running {len(to_run)}/{n_total} simulations{suffix}...")
 
             self._run_simulations(entries, to_run, fn, jobs)
         elif skip_run:
