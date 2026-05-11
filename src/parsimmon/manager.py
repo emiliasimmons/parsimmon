@@ -4,6 +4,7 @@ import argparse
 import ast
 import concurrent.futures
 import copy
+import gc
 import inspect
 import re
 import signal
@@ -41,6 +42,8 @@ def _worker_run_and_save(sim_fn, pars, fn_meta, cache, cache_key):
     result = sim_fn(pars, fn_meta)
     if cache is not None and cache_key is not None:
         cache.save_result(cache_key, result)
+        del result
+        gc.collect()
         return True, None
     return False, result
 
@@ -460,7 +463,10 @@ class Manager:
                     raise
         else:
             for entry_idx, pars, fn_meta, entry_meta, cache_key in to_run:
-                self._save_entry(entries, entry_idx, entry_meta, cache_key, sim_fn(pars, fn_meta))
+                result = sim_fn(pars, fn_meta)
+                self._save_entry(entries, entry_idx, entry_meta, cache_key, result)
+                del result
+                gc.collect()
 
     def _execute(self, name, ps, jobs=None, run_analysis=True, force=False):
         from .results import Results
